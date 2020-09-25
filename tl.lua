@@ -796,6 +796,8 @@ local Type = {}
 
 
 
+
+
 local Operator = {}
 
 
@@ -932,12 +934,28 @@ local Node = {}
 
 
 
+local TypeChecker = {}
+
+local function embeds(t, check)
+   if t.embeds and #t.embeds > 0 then
+      for i, e in ipairs(t.embeds) do
+         if check(e) then
+            return true
+         end
+      end
+   end
+end
+
 local function is_array_type(t)
-   return t.typename == "array" or t.typename == "arrayrecord"
+   return t.typename == "array" or embeds(t, is_array_type)
+end
+
+local function is_map_type(t)
+   return t.typename == "map" or embeds(t, is_map_type)
 end
 
 local function is_record_type(t)
-   return t.typename == "record" or t.typename == "arrayrecord"
+   return t.typename == "record"
 end
 
 local function is_type(t)
@@ -1888,9 +1906,40 @@ local function parse_enum_body(ps, i, def, node)
    return i, node
 end
 
+local function are_disjoint(rec1, rec2)
+   local disjoint = true
+   local shared_fields = {}
+   for field, t in pairs(rec1.fields) do
+      if rec2.fields[field] and rec2.fields[field] ~= t then
+         shared_fields[field] = true
+         disjoint = false
+      end
+   end
+   for field, t in pairs(rec2.fields) do
+      if rec1.fields[field] and rec1.fields[field] ~= t then
+         shared_fields[field] = true
+         disjoint = false
+      end
+   end
+   return disjoint, shared_fields
+end
+
+local function embed_into(rec, embed)
+   if is_record_type(embed) then
+      for field, ft in pairs(embed.fields) do
+         rec.fields[field] = ft
+      end
+      for _, name in ipairs(embed.names) do
+         table.insert(rec.names, name)
+      end
+   end
+   table.insert(rec.embeds, embed)
+end
+
 local function parse_record_body(ps, i, def, node)
    def.fields = {}
    def.field_order = {}
+   def.embeds = {}
    if ps.tokens[i].tk == "<" then
       i, def.typeargs = parse_typearg_list(ps, i)
    end
@@ -1932,6 +1981,10 @@ local function parse_record_body(ps, i, def, node)
          i = parse_nested_type(ps, i, def, "record", parse_record_body)
       elseif ps.tokens[i].tk == "enum" and ps.tokens[i + 1].tk ~= ":" then
          i = parse_nested_type(ps, i, def, "enum", parse_enum_body)
+      elseif ps.tokens[i].tk == "embed" and ps.tokens[i + 1].tk ~= ":" then
+         local t
+         i, t = parse_type(ps, i + 1)
+         embed_into(def, t)
       else
          local v
          i, v = verify_kind(ps, i, "identifier", "variable")
@@ -3339,6 +3392,11 @@ local function show_type_base(t, seen)
       return t.names and table.concat(t.names, ".") or "enum"
    elseif is_record_type(t) then
       local out = {}
+      if t.embeds then
+         for _, k in ipairs(t.embeds) do
+            table.insert(out, "(Embed: " .. show(k) .. ")")
+         end
+      end
       for _, k in ipairs(t.field_order) do
          local v = t.fields[k]
          table.insert(out, k .. ": " .. show(v))
@@ -4378,7 +4436,31 @@ function tl.type_check(ast, opts)
       end
    end
 
+   local resolve_embeds = nil
+   local resolve_unary = nil
+
+   local function has_embedded(t1, t2, eq)
+      t2 = resolve_embeds(t2)
+      t1 = resolve_embeds(t1)
+      t2 = resolve_unary(t2)
+      t1 = resolve_unary(t1)
+
+      local e = t1.embeds
+      if e and #e > 0 then
+         for i = 1, #e do
+            if is_a(e[i], t2, eq, true) then
+               return true
+            end
+         end
+      end
+      return false
+   end
+
    local function are_same_nominals(t1, t2)
+      if has_embedded(t1, t2) then
+         return true
+      end
+
       local same_names
       if t1.found and t2.found then
          same_names = t1.found.typeid == t2.found.typeid
@@ -4428,6 +4510,9 @@ function tl.type_check(ast, opts)
 
       if t1.typename ~= t2.typename then
          return false, terr(t1, "got %s, expected %s", t1, t2)
+      end
+      if has_embedded(t1, t2) then
+         return true
       end
       if t1.typename == "array" then
          return same_type(t1.elements, t2.elements)
@@ -4527,13 +4612,11 @@ function tl.type_check(ast, opts)
       end
    end
 
-   local resolve_unary = nil
-
    local function is_known_table_type(t)
       return (t.typename == "array" or t.typename == "map" or t.typename == "record" or t.typename == "arrayrecord")
    end
 
-   is_a = function(t1, t2, for_equality)
+   is_a = function(t1, t2, for_equality, dont_check_embeds)
       assert(type(t1) == "table")
       assert(type(t2) == "table")
 
@@ -4544,6 +4627,7 @@ function tl.type_check(ast, opts)
       if t1.typename == "nil" then
          return true
       end
+
 
       if t2.typename ~= "tuple" then
          t1 = resolve_tuple(t1)
@@ -4587,7 +4671,13 @@ function tl.type_check(ast, opts)
             end
          end
          return false, terr(t1, "cannot match against any alternatives of the polymorphic type")
-      elseif t1.typename == "nominal" and t2.typename == "nominal" and #t2.names == 1 and t2.names[1] == "any" then
+      end
+
+      if not dont_check_embeds and has_embedded(t1, t2, for_equality) then
+         return true
+      end
+
+      if t1.typename == "nominal" and t2.typename == "nominal" and #t2.names == 1 and t2.names[1] == "any" then
          return true
       elseif t1.typename == "nominal" and t2.typename == "nominal" then
          return are_same_nominals(t1, t2)
@@ -4614,7 +4704,9 @@ function tl.type_check(ast, opts)
                return false, terr(t1, "string is not a %s", t2)
             end
          end
-      elseif t1.typename == "nominal" or t2.typename == "nominal" then
+      end
+
+      if t1.typename == "nominal" or t2.typename == "nominal" then
          local t1u = resolve_unary(t1)
          local t2u = resolve_unary(t2)
          local ok, errs = is_a(t1u, t2u, for_equality)
@@ -4626,7 +4718,10 @@ function tl.type_check(ast, opts)
             end
          end
          return ok, errs
-      elseif t1.typename == "emptytable" and is_known_table_type(t2) then
+      end
+
+
+      if t1.typename == "emptytable" and is_known_table_type(t2) then
          return true
       elseif t2.typename == "array" then
          if is_array_type(t1) then
@@ -5094,6 +5189,7 @@ function tl.type_check(ast, opts)
       check_all_typevars(node, t.typeargs)
       check_all_typevars(node, t.args)
       check_all_typevars(node, t.rets)
+
    end
 
    local function get_rets(rets)
@@ -5191,6 +5287,7 @@ function tl.type_check(ast, opts)
    end
 
    local function resolve_nominal(t)
+      resolve_embeds(t)
       if t.resolved then
          return t.resolved
       end
@@ -5216,9 +5313,69 @@ function tl.type_check(ast, opts)
    end
 
    resolve_unary = function(t)
+      if not t.embeds_resolved then
+         t = resolve_embeds(t)
+      end
       t = resolve_tuple(t)
       if t.typename == "nominal" then
          return resolve_nominal(t)
+      end
+      return t
+   end
+
+   local function can_embed(t1, t2)
+      assert(is_record_type(t1), "Only records can have embeds (how did this even happen?)")
+
+
+
+      if is_record_type(t2) then
+         local compat, fields = are_disjoint(t1, t2)
+         if compat then
+            return compat
+         else
+            local str = {}
+            for f in pairs(fields) do
+               table.insert(str, f)
+            end
+            return nil, "records share fields: " .. table.concat(str, ", ")
+         end
+      end
+
+
+      if is_array_type(t2) then
+         if embeds(t1, is_array_type) then
+            return nil, "record already embeds an array type"
+         end
+      end
+
+
+      if is_map_type(t2) then
+         if embeds(t1, is_map_type) then
+            return nil, "record already embeds a map type"
+         end
+      end
+
+      return false, t2.typename .. " can't be embedded"
+   end
+
+   resolve_embeds = function(t)
+      if t.embeds_resolved or not t.embeds then
+         return t
+      end
+      t.embeds_resolved = true
+      t = resolve_unary(t)
+      for i = 1, #t.embeds do
+         local e = resolve_unary(t.embeds[i])
+         local compat, reason = can_embed(t, e)
+         if not compat then
+            type_error(t, "Invalid embedding: " .. reason)
+         end
+         t.embeds[i] = e
+         if e.fields then
+            for fname, f in pairs(e.fields) do
+               t.fields[fname] = f
+            end
+         end
       end
       return t
    end

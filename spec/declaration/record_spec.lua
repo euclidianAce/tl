@@ -431,4 +431,35 @@ describe("records", function()
       { y = 3, msg = "unknown type S.S3" }
    }))
 
+   describe("embedding", function()
+      it("embed is not a reserved word", util.check [[
+         local record A
+            embed: number
+         end
+      ]])
+      it("should make members of a record available to another", util.check [[
+         local record A
+            a_value: number
+         end
+         local record B
+            embed A
+            b_value: number
+         end
+         local var: B = {}
+         print(var.a_value)
+      ]])
+      it("should allow for generics", util.check [[
+         local record A<T>
+            property_of_a: T
+         end
+
+         local record B<T>
+            embed A<T>
+            property_of_b: string
+         end
+
+         local var: B<number> = {}
+         print(var.property_of_a + 1)
+      ]])
+   end)
 end)
