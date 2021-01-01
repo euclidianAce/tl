@@ -46,7 +46,7 @@ describe("array declarations", function()
       }
       print(x[RED])
    ]], {
-      { msg = "cannot determine type of table literal" },
+      { y = 4, msg = "cannot determine type of table literal" },
    }))
 
    it("explicit number indices work with array-records", util.check [[

@@ -995,15 +995,19 @@ local record Node
    -- local
    is_const: boolean
 
+   is_comptime: boolean
+   comptime_val: any
+   comptime_tuple: {any} -- comptime function call results, should maybe just get rid of comptime_val?
+
    fn_owner: Node
    is_method: boolean
 
-   exp: Node
+   exp: Node -- if `exp` then
    parent_if: Node
-   thenpart: Node
+   thenpart: Node -- then `thenpart` end, the body of that chunk
    elseifs: Node
    elseif_n: number
-   elsepart: Node
+   elsepart: Node -- the body of the `else` chunk
 
    -- fornum
    var: Node
@@ -1022,8 +1026,6 @@ local record Node
    op: Operator
    e1: Node
    e2: Node
-   constnum: number
-   conststr: string
 
    -- table literal
    array_len: number
@@ -1173,7 +1175,8 @@ local function parse_table_item(ps: ParseState, i: number, n: number): number, N
    elseif ps.tokens[i].kind == "identifier" and ps.tokens[i+1].tk == "=" then
       node.key_parsed = "short"
       i, node.key = verify_kind(ps, i, "identifier", "string")
-      node.key.conststr = node.key.tk
+      node.key.comptime_val = node.key.tk
+      node.key.is_comptime = true
       node.key.tk = '"' .. node.key.tk .. '"'
       i = verify_tk(ps, i, "=")
       i, node.value = parse_table_value(ps, i)
@@ -1187,7 +1190,8 @@ local function parse_table_item(ps: ParseState, i: number, n: number): number, N
          errs = {},
       }
       i, node.key = verify_kind(try_ps, i, "identifier", "string")
-      node.key.conststr = node.key.tk
+      node.key.comptime_val = node.key.tk
+      node.key.is_comptime = true
       node.key.tk = '"' .. node.key.tk .. '"'
       i = verify_tk(try_ps, i, ":")
       i, node.decltype = parse_type(try_ps, i)
@@ -1208,7 +1212,8 @@ local function parse_table_item(ps: ParseState, i: number, n: number): number, N
 
    node.key = new_node(ps.tokens, i, "number")
    node.key_parsed = "implicit"
-   node.key.constnum = n
+   node.key.comptime_val = n
+   node.key.is_comptime = true
    node.key.tk = tostring(n)
    i, node.value = parse_expression(ps, i)
    return i, node, n + 1
@@ -1522,7 +1527,8 @@ local function parse_literal(ps: ParseState, i: number): number, Node
       local tk = unquote(ps.tokens[i].tk)
       local node: Node
       i, node = verify_kind(ps, i, "string")
-      node.conststr = tk
+      node.comptime_val = tk
+      node.is_comptime = true
       return i, node
    elseif ps.tokens[i].kind == "identifier" then
       return verify_kind(ps, i, "identifier", "variable")
@@ -1530,12 +1536,15 @@ local function parse_literal(ps: ParseState, i: number): number, Node
       local n = tonumber(ps.tokens[i].tk)
       local node: Node
       i, node = verify_kind(ps, i, "number")
-      node.constnum = n
+      node.comptime_val = n
+      node.is_comptime = true
       return i, node
-   elseif ps.tokens[i].tk == "true" then
-      return verify_kind(ps, i, "keyword", "boolean")
-   elseif ps.tokens[i].tk == "false" then
-      return verify_kind(ps, i, "keyword", "boolean")
+   elseif ps.tokens[i].tk == "true" or ps.tokens[i].tk == "false" then
+      local node: Node
+      i, node = verify_kind(ps, i, "keyword", "boolean")
+      node.comptime_val = node.tk == "true"
+      node.is_comptime = true
+      return i, node
    elseif ps.tokens[i].tk == "nil" then
       return verify_kind(ps, i, "keyword", "nil")
    elseif ps.tokens[i].tk == "function" then
@@ -1646,7 +1655,8 @@ do
             local argument: Node
             if ps.tokens[i].kind == "string" then
                argument = new_node(ps.tokens, i)
-               argument.conststr = unquote(ps.tokens[i].tk)
+               argument.comptime_val = unquote(ps.tokens[i].tk)
+               argument.is_comptime = true
                i = i + 1
             else
                i, argument = parse_table_literal(ps, i)
@@ -1707,7 +1717,7 @@ do
             else
                i, cast.casttype = parse_type(ps, i)
             end
-            e1 = { y = t1.y, x = t1.x, kind = "op", op = op, e1 = e1, e2 = cast, conststr = e1.conststr }
+            e1 = { y = t1.y, x = t1.x, kind = "op", op = op, e1 = e1, e2 = cast, comptime_val = e1.comptime_val, is_comptime = e1.is_comptime }
          else
             break
          end
@@ -1747,8 +1757,14 @@ do
    end
 end
 
+local valid_attributes: {string:boolean} = {
+   ["const"] = true,
+   ["comptime"] = true,
+}
+
 local function parse_variable_name(ps: ParseState, i: number): number, Node, number
-   local is_const: boolean = false
+   local is_const = false
+   local is_comptime = false
    local node: Node
    i, node = verify_kind(ps, i, "identifier")
    if not node then
@@ -1758,11 +1774,15 @@ local function parse_variable_name(ps: ParseState, i: number): number, Node, num
       i = i + 1
       local annotation: Node
       i, annotation = verify_kind(ps, i, "identifier")
+      if not valid_attributes[annotation.tk] then
+         fail(ps, i, "unknown variable annotation: " .. annotation.tk)
+      end
       if annotation then
          if annotation.tk == "const" then
             is_const = true
-         else
-            fail(ps, i, "unknown variable annotation: " .. annotation.tk)
+         elseif annotation.tk == "comptime" then
+            is_const = true
+            is_comptime = true
          end
       else
          fail(ps, i, "expected a variable annotation")
@@ -1770,6 +1790,7 @@ local function parse_variable_name(ps: ParseState, i: number): number, Node, num
       i = verify_tk(ps, i, ">")
    end
    node.is_const = is_const
+   node.is_comptime = is_comptime
    return i, node
 end
 
@@ -2041,6 +2062,15 @@ for k, v in pairs(stop_statement_list) do
    stop_return_list[k] = v
 end
 
+local function all_comptime(nodes: {Node}): boolean
+   for _, v in ipairs(nodes or {}) do
+      if not v.is_comptime then
+         return false
+      end
+   end
+   return true
+end
+
 local function parse_return(ps: ParseState, i: number): number, Node
    local node = new_node(ps.tokens, i, "return")
    i = verify_tk(ps, i, "return")
@@ -2192,7 +2222,8 @@ parse_record_body = function(ps: ParseState, i: number, def: Type, node: Node): 
          local v: Node
          if ps.tokens[i].tk == "[" then
             i, v = parse_literal(ps, i+1)
-            if not v.conststr then
+            local val = v.comptime_val
+            if not v.is_comptime or not val is string then
                return fail(ps, i, "expected a string literal")
             end
             i = verify_tk(ps, i, "]")
@@ -2212,7 +2243,8 @@ parse_record_body = function(ps: ParseState, i: number, def: Type, node: Node): 
                return fail(ps, i, "expected a type")
             end
 
-            local field_name = v.conststr or v.tk
+            local val = v.comptime_val
+            local field_name = val is string and val or v.tk
             local fields = def.fields
             local field_order = def.field_order
             if is_metamethod then
@@ -2342,6 +2374,7 @@ local function parse_variable_declarations(ps: ParseState, i: number, node_name:
          v = v + 1
       until ps.tokens[i].tk ~= ","
    end
+   asgn.is_comptime = all_comptime(asgn.vars) and all_comptime(asgn.exps)
    return i, asgn
 end
 
@@ -2607,6 +2640,19 @@ local function recurse_typeargs<T>(ast: Node, visit_type: Visitor<TypeName, Type
    end
 end
 
+-- local function get_comptime_val(token: string, kind: NodeKind): any
+   -- if kind == "string" then
+      -- return unquote(token)
+   -- elseif kind == "number" then
+      -- TODO: hex
+      -- return tonumber(token)
+   -- elseif kind == "boolean" then
+      -- return token == "true"
+   -- elseif kind == "nil" then
+      -- return nil
+   -- end
+-- end
+
 local function recurse_node<T>(ast: Node,
                                visit_node: Visitor<NodeKind, Node, T>,
                                visit_type: Visitor<TypeName, Type, T>): T
@@ -2744,13 +2790,13 @@ local function recurse_node<T>(ast: Node,
    elseif ast.kind == "variable"
           or ast.kind == "argument"
           or ast.kind == "identifier"
-          or ast.kind == "string"
-          or ast.kind == "number"
           or ast.kind == "break"
           or ast.kind == "goto"
           or ast.kind == "label"
-          or ast.kind == "nil"
           or ast.kind == "..."
+          or ast.kind == "string"
+          or ast.kind == "number"
+          or ast.kind == "nil"
           or ast.kind == "boolean" then
       if ast.decltype then
          xs[1] = recurse_type(ast.decltype, visit_type)
@@ -3814,7 +3860,11 @@ end
 
 local record Variable
    t: Type
+
    is_const: boolean
+   is_comptime: boolean
+   comptime_val: any
+
    needs_compat53: boolean
    narrowed_from: Type
    is_narrowed: boolean
@@ -4029,6 +4079,13 @@ local standard_library: {string:Type} = {
    ["debug"] = a_type {
       typename = "record",
       fields = {
+         ["sethook"] = a_type {
+            typename = "poly",
+            types = {
+               a_type { typename = "function", args = { THREAD, FUNCTION, STRING, NUMBER }, rets = {} },
+               a_type { typename = "function", args = { FUNCTION, STRING, NUMBER }, rets = {} },
+            },
+         },
          ["traceback"] = a_type {
             typename = "poly",
             types = {
@@ -4453,6 +4510,42 @@ tl.init_env = function(lax: boolean, skip_compat53: boolean): Env
    return env
 end
 
+local fstrings: {string:string} = setmetatable({
+   string = "%q",
+   number = "%d",
+   boolean = "%s",
+} as any, { __index = function(): string return "%s" end } as metatable<any>) as {string:string}
+
+local function eval_comptime_un_op(operator: string, e: any): any
+   local chunk = string.format("return " .. operator .. fstrings[type(e)], e)
+   local f = load(chunk)
+   local ok, res = pcall(f)
+   if not ok then
+      -- TODO
+   end
+   return res
+end
+
+local function eval_comptime_bin_op(operator: string, e1: any, e2: any): any
+   local chunk = string.format("return " .. fstrings[type(e1)] .. operator .. fstrings[type(e2)], e1, e2)
+   local f = load(chunk)
+   local ok, res = pcall(f)
+   if not ok then
+      -- TODO
+   end
+   return res
+end
+
+local function compile_comptime_func(func: Node): function
+   local chunk = "return " .. tl.pretty_print_ast(func, fast_pretty_print_ast_opts)
+   local loaded_chunk = load(chunk)
+   local ok, res = pcall(loaded_chunk)
+   if not ok then
+      -- TODO
+   end
+   return res as function
+end
+
 tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, Type
    opts = opts or {}
    opts.env = opts.env or tl.init_env(opts.lax, opts.skip_compat53)
@@ -4762,7 +4855,7 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
       end
    end
 
-   local function add_var(node: Node, var: string, valtype: Type, is_const: boolean, is_narrowing: boolean): Variable
+   local function add_var(node: Node, var: string, valtype: Type, is_const: boolean, is_narrowing: boolean, is_comptime: boolean, comptime_val: any): Variable
       if lax and node and is_unknown(valtype) and (var ~= "self" and var ~= "...") then
          add_unknown(node, var)
       end
@@ -4775,7 +4868,7 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
          old_var.is_narrowed = true
          old_var.t = valtype
       else
-         scope[var] = { t = valtype, is_const = is_const, is_narrowed = is_narrowing, declared_at = node }
+         scope[var] = { t = valtype, is_const = is_const, is_narrowed = is_narrowing, declared_at = node, is_comptime = is_comptime, comptime_val = comptime_val }
          if old_var then
             -- the old var is removed from the scope and won't be checked when it closes,
             -- so check it here
@@ -5963,7 +6056,13 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
       -- get all arguments except the last...
       local is_va = vals.is_va
       for i = 1, #vals - 1 do
-         ret[i] = vals[i]
+         if vals[i].typename == "tuple" then
+            -- result of a function call (probably)
+            -- needs to be adjusted to 1 result
+            ret[i] = vals[i][1] or NIL
+         else
+            ret[i] = vals[i]
+         end
       end
 
       local last = vals[#vals]
@@ -6014,14 +6113,15 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
       b = resolve_unary(b)
 
       if a.typename == "tupletable" and is_a(b, NUMBER) then
-         if idxnode.constnum then
-            if idxnode.constnum > #a.types
-               or idxnode.constnum < 1
-               or idxnode.constnum ~= math.floor(idxnode.constnum)
+         local val = idxnode.comptime_val
+         if val and val is number then
+            if val > #a.types
+               or val < 1
+               or val ~= math.floor(val)
             then
-               return node_error(idxnode, "index " .. tostring(idxnode.constnum) .. " out of range for tuple %s", a)
+               return node_error(idxnode, "index " .. tostring(val) .. " out of range for tuple %s", a)
             end
-            return a.types[idxnode.constnum]
+            return a.types[val]
          else
             local array_type = arraytype_from_tuple(idxnode, a)
             if not array_type then
@@ -6051,7 +6151,7 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
             return node_error(idxnode, "wrong index type: %s, expected %s", orig_b, a.keys)
          end
       elseif node.e2.kind == "string" or node.e2.kind == "enum_item" then
-         return match_record_key(node, a, { y = node.e2.y, x = node.e2.x, kind = "string", tk = assert(node.e2.conststr) }, orig_a)
+         return match_record_key(node, a, { y = node.e2.y, x = node.e2.x, kind = "string", tk = assert(node.e2.comptime_val) as string }, orig_a)
       elseif is_record_type(a) then
          if b.typename == "enum" then
             local field_names: {string} = {}
@@ -6360,8 +6460,9 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
             local b1 = resolve_unary(b[1])
             local b2 = resolve_unary(b[2])
             local knode = node.e2[2]
-            if is_record_type(b1) and knode.conststr then
-               return match_record_key(node, b1, { y = knode.y, x = knode.x, kind = "string", tk = assert(knode.conststr) }, b1)
+            local val = knode.comptime_val
+            if is_record_type(b1) and val is string then
+               return match_record_key(node, b1, { y = knode.y, x = knode.x, kind = "string", tk = assert(val) }, b1)
             else
                return type_check_index(node, knode, b1, b2)
             end
@@ -6374,7 +6475,8 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
       elseif node.e1.tk == "require" then
          if #b == 1 then
             if node.e2[1].kind == "string" then
-               local module_name = assert(node.e2[1].conststr)
+               local val = node.e2[1].comptime_val
+               local module_name = assert(val is string and val)
                local t, found = require_module(module_name, lax, opts.env, result)
                if not found then
                   node_error(node, "module not found: '" .. module_name .. "'")
@@ -6451,6 +6553,7 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
          end,
          after = function(node: Node, _children: {Type}): Type
             dismiss_unresolved(node.var.tk)
+            node.is_comptime = true
             node.type = NONE
          end,
       },
@@ -6486,16 +6589,28 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
                   infertype = nil
                end
                if decltype and infertype then
-                  assert_is_a(node.vars[i], infertype, decltype, "local declaration", var.tk)
+                  assert_is_a(var, infertype, decltype, "local declaration", var.tk)
+               end
+               if var.is_comptime then
+                  local comptime_exp = node.exps[i] and node.exps[i].comptime_val
+                  if not comptime_exp and node.exps[#node.exps].comptime_tuple then
+                     comptime_exp = node.exps[#node.exps].comptime_tuple[i - #node.exps + 1]
+                  end
+                  if comptime_exp then
+                     var.is_comptime = true
+                     var.comptime_val = comptime_exp
+                  else
+                     node_error(var, string.format("comptime variable '%s' is not being assigned a compile time known value", var.tk))
+                  end
                end
                local t = decltype or infertype
                if t == nil then
                   t = a_type { typename = "unknown" }
                   if not lax then
                      if node.exps then
-                        node_error(node.vars[i], "assignment in declaration did not produce an initial value for variable '" .. var.tk .. "'")
+                        node_error(var, "assignment in declaration did not produce an initial value for variable '" .. var.tk .. "'")
                      else
-                        node_error(node.vars[i], "variable '" .. var.tk .. "' has no type or initial value")
+                        node_error(var, "variable '" .. var.tk .. "' has no type or initial value")
                      end
                   end
                elseif t.typename == "emptytable" then
@@ -6512,10 +6627,11 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
                end
 
                assert(var)
-               add_var(var, var.tk, t, var.is_const)
+               add_var(var, var.tk, t, var.is_const, nil, var.is_comptime, var.comptime_val)
 
                dismiss_unresolved(var.tk)
             end
+            node.is_comptime = all_comptime(node.vars) and all_comptime(node.exps)
             node.type = NONE
          end,
       },
@@ -6530,6 +6646,9 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
                end
                if decltype and infertype then
                   assert_is_a(node.vars[i], infertype, decltype, "global declaration", var.tk)
+               end
+               if var.is_comptime then
+                  node_error(var, "only locals may be <comptime>")
                end
                local t = decltype or infertype
                local existing, existing_is_const = find_global(var.tk)
@@ -6569,7 +6688,7 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
             for i, vartype in ipairs(children[1]) do
                local varnode = node.vars[i]
                if varnode.is_const then
-                  node_error(varnode, "cannot assign to <const> variable")
+                  node_error(varnode, string.format("cannot assign to <%s> variable", varnode.is_const and "const" or varnode.is_comptime and "comptime" or "?"))
                end
                if varnode.kind == "variable" then
                   if widen_back_var(varnode.tk) then
@@ -6598,6 +6717,7 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
       },
       ["do"] = {
          after = function(node: Node, _children: {Type}): Type
+            node.is_comptime = all_comptime(node.body)
             node.type = NONE
          end,
       },
@@ -6609,6 +6729,10 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
          after = function(node: Node, _children: {Type}): Type
             end_scope()
             node.type = NONE
+            node.is_comptime = all_comptime(node.thenpart) and all_comptime(node.elseifs)
+            if node.elsepart then
+               node.is_comptime = node.is_comptime and node.elsepart.is_comptime
+            end
          end,
       },
       ["elseif"] = {
@@ -6626,6 +6750,7 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
          end,
          after = function(node: Node, _children: {Type}): Type
             node.type = NONE
+            node.is_comptime = all_comptime(node.thenpart)
          end,
       },
       ["else"] = {
@@ -6640,6 +6765,7 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
          end,
          after = function(node: Node, _children: {Type}): Type
             node.type = NONE
+            node.is_comptime = all_comptime(node.elsepart)
          end,
       },
       ["while"] = {
@@ -6654,6 +6780,7 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
          after = function(node: Node, _children: {Type}): Type
             end_scope()
             node.type = NONE
+            node.is_comptime = node.exp.is_comptime and all_comptime(node.body)
          end,
       },
       ["label"] = {
@@ -6697,6 +6824,7 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
          after = function(node: Node, _children: {Type}): Type
             -- only end scope after checking `until`, `statements` in repeat body has is_return == true
             end_scope()
+            node.is_comptime = node.exp.is_comptime and all_comptime(node.body)
             node.type = NONE
          end,
       },
@@ -6759,6 +6887,9 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
          end,
          after = function(node: Node, _children: {Type}): Type
             end_scope()
+            node.is_comptime = node.from.is_comptime
+               and node.to.is_comptime
+               and (not node.step or node.step.is_comptime)
             node.type = NONE
          end,
       },
@@ -6794,6 +6925,7 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
                module_type = resolve_unary(children[1])
             end
 
+            node.is_comptime = all_comptime(node.exps)
             node.type = NONE
          end,
       },
@@ -6872,7 +7004,7 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
                         node.type.elements = expand_type(node, node.type.elements, child.vtype)
                      end
                   else -- explicit
-                     local n = node[i].key.constnum
+                     local n = node[i].key.comptime_val as number
 
                      if not is_positive_int(n) then
                         node.type.elements = expand_type(node, node.type.elements, child.vtype)
@@ -6952,7 +7084,8 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
       },
       ["table_item"] = {
          after = function(node: Node, children: {Type}): Type
-            local kname = node.key.conststr
+            local val = node.key.comptime_val
+            local kname = val is string and val or nil
             local ktype = children[1]
             local vtype = children[2]
             if node.decltype then
@@ -7081,6 +7214,11 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
                args = children[1],
                rets = children[2],
             }
+
+            node.is_comptime = all_comptime(node.body)
+            if node.is_comptime then
+               node.comptime_val = compile_comptime_func(node)
+            end
          end,
       },
       ["cast"] = {
@@ -7117,6 +7255,36 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
             local ub = b and resolve_unary(b)
             if node.op.op == "@funcall" then
                node.type = type_check_funcall(node, a, b)
+               if node.e1.is_comptime and node.e1.comptime_val then
+                  node.is_comptime = all_comptime(node.e2)
+                  local args: {any} = {}
+                  for i, n in ipairs(node.e2) do
+                     args[i] = n.comptime_val
+                  end
+
+                  local t = coroutine.create(node.e1.comptime_val as function)
+                  local instruction_count = 0
+                  local max_instructions = 1e6 -- TODO: this should be a config option
+                  debug.sethook(t, function()
+                     instruction_count = instruction_count + 1000
+                     if instruction_count > max_instructions then
+                        error(string.format("Compile time function execution exceeded %d instructions.", max_instructions), 0)
+                     end
+                  end, "", 1000)
+
+                  local res: {any} = {coroutine.resume(t, table.unpack(args, 1, #node.e2))}
+                  if coroutine.status(t) ~= "dead" then
+                     node_error(node, "Compile time function yielded for some reason...")
+                  else
+                     local ok = table.remove(res, 1)
+                     if ok then
+                        node.comptime_val = res[1]
+                        node.comptime_tuple = res
+                     else
+                        node_error(node, tostring(res[1]))
+                     end
+                  end
+               end
             elseif node.op.op == "@index" then
                node.type = type_check_index(node, node.e2, a, b)
             elseif node.op.op == "as" then
@@ -7203,6 +7371,11 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
                   end
                end
 
+               if node.e1.is_comptime then
+                  node.is_comptime = true
+                  node.comptime_val = eval_comptime_un_op(node.op.op, node.e1.comptime_val)
+               end
+
             elseif node.op.arity == 2 and binop_types[node.op.op] then
                if node.op.op == "or" then
                   node.facts = facts_or(node.e1.facts, node.e2.facts)
@@ -7246,6 +7419,14 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
                      convert_node_to_compat_call(node, "bit32", bit_operators[node.op.op], node.e1, node.e2)
                   end
                end
+
+               if node.e1.is_comptime and node.e2.is_comptime then
+                  node.is_comptime = true
+                  if node.e1.comptime_val and node.e2.comptime_val then
+                     node.comptime_val = eval_comptime_bin_op(node.op.op, node.e1.comptime_val, node.e2.comptime_val)
+                  end
+               end
+
             else
                error("unknown node op " .. node.op.op)
             end
@@ -7261,14 +7442,19 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
                end
             end
 
-            node.type, node.is_const = find_var_type(node.tk)
-            if node.type == nil then
+            local var = find_var(node.tk)
+            if not var then
                node.type = a_type { typename = "unknown" }
                if lax then
                   add_unknown(node, node.tk)
                else
                   node_error(node, "unknown variable: " .. node.tk)
                end
+            else
+               node.type = var.t
+               node.is_const = var.is_const
+               node.is_comptime = var.is_comptime or var.is_func_arg
+               node.comptime_val = var.comptime_val
             end
          end,
       },
