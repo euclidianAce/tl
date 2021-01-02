@@ -7289,6 +7289,8 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
                node.type = type_check_index(node, node.e2, a, b)
             elseif node.op.op == "as" then
                node.type = b
+               node.is_comptime = node.e1.is_comptime
+               node.comptime_val = node.e1.comptime_val
             elseif node.op.op == "is" then
                if node.e1.kind == "variable" then
                   node.facts = { { fact = "is", var = node.e1.tk, typ = b } }
@@ -7296,6 +7298,8 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
                   node_error(node, "can only use 'is' on variables")
                end
                node.type = BOOLEAN
+               node.is_comptime = node.e1.is_comptime
+               node.comptime_val = node.e1.comptime_val
             elseif node.op.op == "." then
                a = ua
                if a.typename == "map" then
@@ -7318,6 +7322,10 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
             elseif node.op.op == "not" then
                node.facts = facts_not(node.e1.facts)
                node.type = BOOLEAN
+               if node.e1.is_comptime and node.e1.comptime_val ~= nil then
+                  node.is_comptime = true
+                  node.comptime_val = not node.e1.comptime_val
+               end
             elseif node.op.op == "and" then
                node.facts = facts_and(node.e1.facts, node.e2.facts, node)
                node.type = resolve_tuple(b)
